@@ -1,0 +1,194 @@
+#!/usr/bin/ruby
+#
+# rails-timing
+#
+# Analyzer for Ruby on Rails log files.
+#
+# (C) Arnold Ude, 2012
+#
+require "lib/verbose_progress.rb"
+require "lib/descript_stat.rb"
+require "date"
+
+max_ntiles = 5
+@green_less_than_ms = 1300
+@red_greather_than_ms = 4500
+
+def ms2time(ms,colorize = false)
+    if colorize
+        prefix = "<span class=orange>"
+        prefix = "<span class=green>" if ms < @green_less_than_ms
+        prefix = "<span class=red>" if ms > @red_greather_than_ms
+    else
+        prefix = "<span class=timing>"
+    end
+    if ms < 1500
+        return prefix + sprintf('%.0f',ms)+ " msec" + "</span>"
+    else
+        ms = ms / 1000.0
+        if ms < 120
+            return prefix + sprintf('%.1f',ms)+ " sec" + "</span>"
+        else
+            ms = ms / 60
+            if ms < 90
+                return prefix + sprintf('%.1f',ms)+ " min" + "</span>"
+            else
+                ms = ms / 60
+                if ms < 72
+                    return prefix + sprintf('%.1f',ms)+ " hours" + "</span>"
+                else
+                    ms = ms / 24
+                    return prefix + sprintf('%.1f',ms)+ " days" + "</span>"
+                end
+            end
+        end
+    end
+end
+
+def percentage(val)
+    return sprintf('%.1f',100.0 * val)+"%"
+end
+
+puts "rails-timing (C) Arnold Ude, MEDLINQ GmbH 2012"
+puts " "
+
+requests = []
+sessions = {}
+
+request = {}
+
+puts "* reading data"
+ARGV.each do |fname|
+    File.open(fname,"r") do |file|
+        readstatus = 0
+        while line = file.gets do
+            if line =~ /^Processing ([^ ]*) \(for[^a]*at ([0-9\- :]*)/
+                request = {:name => $1,:session => "", :timing => 0.0000, :timestamp => DateTime.parse($2), :logged_in => true}
+            end
+            if line =~ /Filter chain halted/
+                request[:logged_in] = false
+            end
+            if line =~ /Session ID: (.*)/
+                request[:session] = $1
+            end
+            if line =~ /^Completed in ([0-9\.]*)/
+                request[:timing] = $1.to_f
+                requests << request if request[:logged_in]
+            end
+        end
+    end
+end
+
+puts "* sorting data"
+
+requests.sort! {|a,b| a[:timestamp] <=> b[:timestamp]}
+
+puts "* analyzing data"
+
+if requests.size == 0
+    puts "Es wurden keinerlei Requests gefunden."
+    exit(1)
+
+end
+
+totalruntime = 1000.0 * (requests[-1][:timestamp].strftime("%s").to_i - requests[0][:timestamp].strftime("%s").to_i)
+totalreqtime = 0.0
+
+requests.each { |r| totalreqtime += 1000.0 * r[:timing]}
+
+requests.each do |r|
+    if r[:logged_in]
+        @mysess = sessions[r[:session]]
+        unless @mysess
+            @mysess = {:first_run => r[:timestamp], :last_run => r[:timestamp], :timing => 0.00, :requests => 0}
+        end
+        @mysess[:requests] = @mysess[:requests] + 1
+        @mysess[:timing] = @mysess[:timing] + r[:timing]
+        @mysess[:last_run] = r[:timestamp]
+        sessions[r[:session]] = @mysess
+    end
+end
+
+totalsessiontime = 0.00
+sessions.each do |a,b|
+    delta = b[:last_run].strftime("%s").to_i - b[:first_run].strftime("%s").to_i
+    totalsessiontime += delta
+end
+
+methods = {}
+requests.each do |r|
+    @mymet = methods[r[:name]]
+    unless @mymet
+        @mymet = DescriptStat.new
+    end
+    @mymet.add(1000.0 * r[:timing])
+    methods[r[:name]] = @mymet
+end
+
+method_array = methods.to_a.sort {|a,b| b[1].sum <=> a[1].sum }
+
+puts "* formatting output"
+File.open("results.html","w") do |html|
+    html.puts "<html>\n<head><title>Rails-Timing : Analysis of Ruby on Rails log files</title>\n"
+    html.puts "<style>\n"
+    html.puts "body { font-family: arial; font-size: 11pt; }\n"
+    html.puts "td,th { vertical-align: top; }\n"
+    html.puts "th { text-align:left; vertical-align: top; }\n"
+    html.puts "tr.small td { font-size: 10pt; }\n"
+    html.puts "span.timing { color : black; }\n"
+    html.puts "span.green { color : green; }\n"
+    html.puts "span.orange { color : orange; }\n"
+    html.puts "span.red { color : red; }\n"
+    html.puts "</style>\n"
+    html.puts "</head>\n<body>\n"
+    html.puts "<h1>Analysis of Ruby on Rails log files</h1>\n"
+    html.puts "<p>Counting only logged in requests to prevent accounting of status requests polled by NAGIOS.</p>"
+    html.puts "<table border=0>\n"
+    html.puts "<tr><td colspan=3><h2>Totals</h2></td></tr>\n"
+    html.puts "<tr><td>Considered period:</td><td>#{requests[0][:timestamp].strftime}<br>#{requests[-1][:timestamp].strftime}</td><td>Timestamp of first and last request logged</td></tr>\n"
+    html.puts "<tr><td>Accounted time:</td><td>#{ms2time(totalruntime)}</td><td>Duration between first and last request</td></tr>\n"
+    html.puts "<tr><td>Requests:</td><td>#{requests.size} single requests</td><td>Number of total requests logged (from real users)</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{sprintf('%.1f',(requests.size * 3600000)/totalruntime)} requests/hour</td><td>Average number of requests per hour over total log</td></tr>\n"
+    html.puts "<tr><td>Processing time:</td><td>#{ms2time(totalreqtime)}</td><td>Total amount of time all Railsprocesses worked during logged period</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(totalreqtime/requests.size)} per request</td><td>Average amount of time spent on work per request</td></tr>\n"
+    html.puts "<tr><td>Server utilization (all processes):</td><td>#{percentage(totalreqtime / totalruntime)}</td><td>Percentage of worktime spent during period. Has to be divided by number of involved processes</td></tr>\n"
+    html.puts "<tr><td colspan=3><br><h2>Sessions</h2></td></tr>\n"
+    html.puts "<tr><td>Number of sessions:</td><td>#{sessions.count} sessions</td><td>Number of distinct users accessing Railsapp during period</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{sprintf('%.1f',(sessions.size * 3600000)/totalruntime)} sessions/hour</td><td>Number of new users accessing Railsapp on average</td></tr>\n"
+    html.puts "<tr><td>Duration of session:</td><td>#{ms2time(1000*totalsessiontime)}</td><td>Total time sessions active for all users</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(1000*totalsessiontime/sessions.count)}</td><td>Time user spent on Rails app per user on average</td></tr>\n"
+    html.puts "<tr><td>Requests:</td><td>#{sprintf('%.1f',requests.count / sessions.count)} requests / session</td><td>Average number of requests per user</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(1000.0 * totalsessiontime / requests.count)}</td><td>average time between requests in a single session</td></tr>\n"
+    html.puts "<tr><td>Waiting time:</td><td>#{ms2time(totalreqtime / sessions.count)}</td><td>Total waiting time between requests per user session</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(totalreqtime/requests.size)} per request</td><td>Average amount of waiting time after request from user</td></tr>\n"
+    html.puts "<tr><td>&nbsp;</td><td>#{percentage(0.001 * totalreqtime / totalsessiontime)}</td><td>Percentage of waiting time per session</td></tr>\n"
+
+    html.puts "</table>\n"
+    html.puts "<table cellpadding=3 border=0>\n"
+
+    html.puts "<tr><th>Request<br>URL</th><th>Number<br>times</br>called</th><th>Total<br>Time<br>spent</th><th>Percent<br>total<br>time</th><th>Average</th><th>Mean</th>"
+    (1..max_ntiles-1).each do |i|
+        html.puts "<th>#{percentage(1.0 * i / max_ntiles)}<br>run in <br>less than</th>"
+    end
+    html.puts "<th>Max<br>time<br>needed</th></tr>\n"        
+    
+    method_array.each do |a|
+        quartils = a[1].ntile(max_ntiles)
+        if quartils[0] > @green_less_than_ms
+            html.puts "<tr class=small><td>#{a[0]}</td>"+
+                "<td>#{a[1].size}</td>" +
+                "<td>#{ms2time(a[1].sum,false)}</td>"+
+                "<td>#{percentage(a[1].sum / totalreqtime)}</td>"+
+                "<td>#{ms2time(a[1].average,true)}</td>"+
+                "<td>#{ms2time(a[1].mean,true)}</td>"
+                (1..max_ntiles-1).each do |i|
+                  html.puts "<td>#{ms2time(quartils[i],true)}</td>"
+                end
+                html.puts "<td>#{ms2time(quartils[0],true)}</td></tr>\n"
+        end
+    end
+
+    html.puts "</table>\n"
+    html.puts "</body>\n</html>\n"
+end
+
