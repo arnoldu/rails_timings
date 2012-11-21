@@ -91,6 +91,7 @@ class DescriptStat
 
     def ntile(divisions)
         tmp = []
+        sort
         divisions.times do |i|
             dv = ((i * n ) / divisions).to_i - 1
             tmp << @data[dv]

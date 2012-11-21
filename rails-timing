@@ -53,42 +53,53 @@ puts "rails-timing (C) Arnold Ude, MEDLINQ GmbH 2012"
 puts " "
 
 requests = []
+methods = {}
 sessions = {}
-
 request = {}
+requests_per_hour = []
 
 puts "* reading data"
 ARGV.each do |fname|
     File.open(fname,"r") do |file|
         readstatus = 0
         while line = file.gets do
+            # Requests Rails 2.x.x
             if line =~ /^Processing ([^ ]*) \(for[^a]*at ([0-9\- :]*)/
-                request = {:name => $1,:session => "", :timing => 0.0000, :timestamp => DateTime.parse($2), :logged_in => true}
+                                              request = {:name => $1,:session => "", :timing => 0.0000, :timestamp => DateTime.parse($2), :logged_in => true}
             end
+            # Requests Rails 3.x.x
+            if line =~ /^Started (GET|POST) "([^"]*)" for [^a]*at ([a-zA-Z+0-9\- :]*)/
+                request = {:name => $2,:session => "", :timing => 0.0000, :timestamp => DateTime.parse($3), :logged_in => true}
+            end
+            if line =~ /  Processing by ([^ ]*)/
+                request[:name] = $1
+            end
+
             if line =~ /Filter chain halted/
                 request[:logged_in] = false
             end
             if line =~ /Session ID: (.*)/
                 request[:session] = $1
             end
+            # Rails 2.x.x
             if line =~ /^Completed in ([0-9\.]*)/
                 request[:timing] = $1.to_f
+                requests << request if request[:logged_in]
+            end
+            # Rails 3.x.x
+            if line =~ /^Completed [0-9]* [^ ]* in ([0-9\.]*)/
+                request[:timing] = $1.to_f/1000.0 # in ms
                 requests << request if request[:logged_in]
             end
         end
     end
 end
 
-puts "* sorting data"
-
 requests.sort! {|a,b| a[:timestamp] <=> b[:timestamp]}
 
-puts "* analyzing data"
-
 if requests.size == 0
-    puts "Es wurden keinerlei Requests gefunden."
+    puts "no requests found to process. Exited."
     exit(1)
-
 end
 
 totalruntime = 1000.0 * (requests[-1][:timestamp].strftime("%s").to_i - requests[0][:timestamp].strftime("%s").to_i)
@@ -96,44 +107,55 @@ totalreqtime = 0.0
 
 requests.each { |r| totalreqtime += 1000.0 * r[:timing]}
 
-requests.each do |r|
-    if r[:logged_in]
-        @mysess = sessions[r[:session]]
-        unless @mysess
-            @mysess = {:first_run => r[:timestamp], :last_run => r[:timestamp], :timing => 0.00, :requests => 0}
-        end
-        @mysess[:requests] = @mysess[:requests] + 1
-        @mysess[:timing] = @mysess[:timing] + r[:timing]
-        @mysess[:last_run] = r[:timestamp]
-        sessions[r[:session]] = @mysess
-    end
-end
-
 totalsessiontime = 0.00
 sessions.each do |a,b|
     delta = b[:last_run].strftime("%s").to_i - b[:first_run].strftime("%s").to_i
     totalsessiontime += delta
 end
 
-methods = {}
-requests.each do |r|
-    @mymet = methods[r[:name]]
-    unless @mymet
-        @mymet = DescriptStat.new
+
+last_timestamp = 0
+VerboseProgress.new("Analyzing requests",requests.size) do |progress|
+    requests.each_index do |idx|
+        r = requests[idx]
+        if r[:logged_in]
+            @mysess = sessions[r[:session]]
+            unless @mysess
+                @mysess = {:first_run => r[:timestamp], :last_run => r[:timestamp], :timing => 0.00, :requests => 0}
+            end
+            @mysess[:requests] = @mysess[:requests] + 1
+            @mysess[:timing] = @mysess[:timing] + r[:timing]
+            @mysess[:last_run] = r[:timestamp]
+            sessions[r[:session]] = @mysess
+        end       
+        @mymet = methods[r[:name]]
+        unless @mymet
+            @mymet = DescriptStat.new
+        end
+        @mymet.add(1000.0 * r[:timing])
+        methods[r[:name]] = @mymet
+        massaged_timestamp = DateTime.parse(r[:timestamp].strftime("%Y-%m-%d %H:00:00"))
+        if massaged_timestamp != last_timestamp
+            requests_per_hour << {:timestamp => massaged_timestamp,:count => 0, :timing => 0.0}
+            last_timestamp = massaged_timestamp
+        end
+        requests_per_hour[-1][:count] = requests_per_hour[-1][:count] + 1
+        requests_per_hour[-1][:timing] = requests_per_hour[-1][:timing] + 1000.0 * r[:timing]
+        progress.progress(idx+1)
     end
-    @mymet.add(1000.0 * r[:timing])
-    methods[r[:name]] = @mymet
 end
 
-method_array = methods.to_a.sort {|a,b| b[1].sum <=> a[1].sum }
+method_array = methods.to_a.sort {|a,b| b[1].max <=> a[1].max }
 
-puts "* formatting output"
 File.open("results.html","w") do |html|
     html.puts "<html>\n<head><title>Rails-Timing : Analysis of Ruby on Rails log files</title>\n"
+    html.puts "<script src='http://www.udeedv.com/rgraph/libraries/RGraph.common.core.js'></script>\n"
+    html.puts "<script src='http://www.udeedv.com/rgraph/libraries/RGraph.scatter.js' ></script>\n"
     html.puts "<style>\n"
     html.puts "body { font-family: arial; font-size: 11pt; }\n"
     html.puts "td,th { vertical-align: top; }\n"
     html.puts "th { text-align:left; vertical-align: top; }\n"
+    html.puts "tr.small_optimize td { font-size: 10pt; background-color: #CCCCCC; }\n"
     html.puts "tr.small td { font-size: 10pt; }\n"
     html.puts "span.timing { color : black; }\n"
     html.puts "span.green { color : green; }\n"
@@ -152,18 +174,22 @@ File.open("results.html","w") do |html|
     html.puts "<tr><td>Processing time:</td><td>#{ms2time(totalreqtime)}</td><td>Total amount of time all Railsprocesses worked during logged period</td></tr>\n"
     html.puts "<tr><td>&nbsp;</td><td>#{ms2time(totalreqtime/requests.size)} per request</td><td>Average amount of time spent on work per request</td></tr>\n"
     html.puts "<tr><td>Server utilization (all processes):</td><td>#{percentage(totalreqtime / totalruntime)}</td><td>Percentage of worktime spent during period. Has to be divided by number of involved processes</td></tr>\n"
-    html.puts "<tr><td colspan=3><br><h2>Sessions</h2></td></tr>\n"
-    html.puts "<tr><td>Number of sessions:</td><td>#{sessions.count} sessions</td><td>Number of distinct users accessing Railsapp during period</td></tr>\n"
-    html.puts "<tr><td>&nbsp;</td><td>#{sprintf('%.1f',(sessions.size * 3600000)/totalruntime)} sessions/hour</td><td>Number of new users accessing Railsapp on average</td></tr>\n"
-    html.puts "<tr><td>Duration of session:</td><td>#{ms2time(1000*totalsessiontime)}</td><td>Total time sessions active for all users</td></tr>\n"
-    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(1000*totalsessiontime/sessions.count)}</td><td>Time user spent on Rails app per user on average</td></tr>\n"
-    html.puts "<tr><td>Requests:</td><td>#{sprintf('%.1f',requests.count / sessions.count)} requests / session</td><td>Average number of requests per user</td></tr>\n"
-    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(1000.0 * totalsessiontime / requests.count)}</td><td>average time between requests in a single session</td></tr>\n"
-    html.puts "<tr><td>Waiting time:</td><td>#{ms2time(totalreqtime / sessions.count)}</td><td>Total waiting time between requests per user session</td></tr>\n"
-    html.puts "<tr><td>&nbsp;</td><td>#{ms2time(totalreqtime/requests.size)} per request</td><td>Average amount of waiting time after request from user</td></tr>\n"
-    html.puts "<tr><td>&nbsp;</td><td>#{percentage(0.001 * totalreqtime / totalsessiontime)}</td><td>Percentage of waiting time per session</td></tr>\n"
+    if sessions.count > 1
+        html.puts "<tr><td colspan=3><br><h2>Sessions</h2></td></tr>\n"
+        html.puts "<tr><td>Number of sessions:</td><td>#{sessions.count} sessions</td><td>Number of distinct users accessing Railsapp during period</td></tr>\n"
+        html.puts "<tr><td>&nbsp;</td><td>#{sprintf('%.1f',(sessions.size * 3600000)/totalruntime)} sessions/hour</td><td>Number of new users accessing Railsapp on average</td></tr>\n"
+        html.puts "<tr><td>Duration of session:</td><td>#{ms2time(1000*totalsessiontime)}</td><td>Total time sessions active for all users</td></tr>\n"
+        html.puts "<tr><td>&nbsp;</td><td>#{ms2time(1000*totalsessiontime/sessions.count)}</td><td>Time user spent on Rails app per user on average</td></tr>\n"
+        html.puts "<tr><td>Requests:</td><td>#{sprintf('%.1f',requests.count / sessions.count)} requests / session</td><td>Average number of requests per user</td></tr>\n"
+        html.puts "<tr><td>&nbsp;</td><td>#{ms2time(1000.0 * totalsessiontime / requests.count)}</td><td>average time between requests in a single session</td></tr>\n"
+        html.puts "<tr><td>Waiting time:</td><td>#{ms2time(totalreqtime / sessions.count)}</td><td>Total waiting time between requests per user session</td></tr>\n"
+        html.puts "<tr><td>&nbsp;</td><td>#{ms2time(totalreqtime/requests.size)} per request</td><td>Average amount of waiting time after request from user</td></tr>\n"
+        html.puts "<tr><td>&nbsp;</td><td>#{percentage(0.001 * totalreqtime / totalsessiontime)}</td><td>Percentage of waiting time per session</td></tr>\n"
+    end
 
     html.puts "</table>\n"
+    html.puts "<h2>Slowest requests</h2>\n"
+    html.puts "<p>The slowest requests are shown, sorted by max request time.</p>\n"
     html.puts "<table cellpadding=3 border=0>\n"
 
     html.puts "<tr><th>Request<br>URL</th><th>Number<br>times</br>called</th><th>Total<br>Time<br>spent</th><th>Percent<br>total<br>time</th><th>Average</th><th>Mean</th>"
@@ -171,24 +197,58 @@ File.open("results.html","w") do |html|
         html.puts "<th>#{percentage(1.0 * i / max_ntiles)}<br>run in <br>less than</th>"
     end
     html.puts "<th>Max<br>time<br>needed</th></tr>\n"        
-    
+
     method_array.each do |a|
         quartils = a[1].ntile(max_ntiles)
-        if quartils[0] > @green_less_than_ms
-            html.puts "<tr class=small><td>#{a[0]}</td>"+
-                "<td>#{a[1].size}</td>" +
-                "<td>#{ms2time(a[1].sum,false)}</td>"+
-                "<td>#{percentage(a[1].sum / totalreqtime)}</td>"+
-                "<td>#{ms2time(a[1].average,true)}</td>"+
-                "<td>#{ms2time(a[1].mean,true)}</td>"
-                (1..max_ntiles-1).each do |i|
-                  html.puts "<td>#{ms2time(quartils[i],true)}</td>"
-                end
-                html.puts "<td>#{ms2time(quartils[0],true)}</td></tr>\n"
+        # Color the lines accordingly to optimization potential
+        row_class = "small"
+        if (a[1].mean > @green_less_than_ms) and 
+            (a[1].sum/totalreqtime >= 0.01)
+            row_class = "small_optimize"
         end
+        html.puts "<tr class='#{row_class}'><td>#{a[0]}</td>"+
+            "<td>#{a[1].size}</td>" +
+            "<td>#{ms2time(a[1].sum,false)}</td>"+
+            "<td>#{percentage(a[1].sum / totalreqtime)}</td>"+
+            "<td>#{ms2time(a[1].average,true)}</td>"+
+            "<td>#{ms2time(a[1].mean,true)}</td>"
+        (1..max_ntiles-1).each do |i|
+            html.puts "<td>#{ms2time(quartils[i],true)}</td>"
+        end
+        html.puts "<td>#{ms2time(quartils[0],true)}</td></tr>\n"
+        break if quartils[0] <= @green_less_than_ms
     end
 
     html.puts "</table>\n"
+    html.puts "<h2>Load over time</h2>\n"
+    html.puts "<p>The graph shows relative load in percent over time. 100% ist equal to 1 processor at full load. So for real server load, the percentage has to be devided by the number of servers * processors.</p>\n"
+    html.puts "<canvas id='busygraph' width=1000 heigth=450>Your browser doesn't support HTML5 and Canvas. So busyhours graph is not shown here</canvas>\n"
+    html.puts "<script>\n"
+    html.puts "window.onload = function() {\n"
+    html.puts "  var scatter= new RGraph.Scatter('busygraph',[\n"
+    first_timestamp = requests_per_hour[0][:timestamp].strftime('%s').to_i
+    requests_per_hour.each do |rh|
+        html.puts "    [#{(rh[:timestamp].strftime('%s').to_i-first_timestamp)/3600.0+0.5}, #{rh[:timing]/36000}, 'blue'],\n"
+    end
+    html.puts "         ]);\n"
+    html.puts "  scatter.Set('chart.xmax', #{(requests_per_hour[-1][:timestamp].strftime('%s').to_i - first_timestamp)/3600.0+1.0});\n"
+    html.puts "  scatter.Set('chart.line',true);\n"
+    html.puts "  scatter.Set('chart.gutter.left',45);\n"
+    html.puts "  scatter.Set('chart.title','Relative processor load over time');\n"
+    html.puts "  scatter.Set('chart.title.yaxis','Percent');\n"
+    html.puts "  scatter.Set('chart.line.linewidth',2);\n"
+    html.puts "  scatter.Set('chart.tickmarks','circle');\n"
+    html.print "  scatter.Set('chart.labels', ["
+    i=0
+    while i < requests_per_hour.size do
+        html.print "'^#{requests_per_hour[i][:timestamp].strftime('%d.%m. %Hh')}',"
+        i += (requests_per_hour.size / 10).to_i
+    end
+    html.puts "   ])\n"
+
+
+    html.puts "  scatter.Draw();\n"
+    html.puts "\}\n</script>\n"
     html.puts "</body>\n</html>\n"
 end
 
